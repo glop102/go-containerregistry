@@ -293,9 +293,18 @@ func extract(img v1.Image, w io.Writer) error {
 }
 
 func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, layer v1.Layer) error {
-	// Opaque markers in this layer hide only lower layers, so stage them and
-	// promote to opaqueDirs after the whole layer is processed.
+	// Whiteouts (.wh.NAME) and opaque markers (.wh..wh..opq) hide entries in
+	// lower layers only; per the image spec an entry that sits next to its own
+	// whiteout in the same layer stays visible, whatever the member order.  So
+	// they are collected here and only merged into fileMap/opaqueDirs once the
+	// whole layer has been read.
 	layerOpaque := map[string]bool{}
+	layerTombstones := map[string]bool{}
+	// Names this layer wrote to the output as regular files or hardlinks.  A
+	// hardlink in this layer whose target is not among them cannot be exported
+	// as a hardlink (the target was hidden or replaced by an upper layer), so
+	// the target's content is copied under the link's name instead.
+	emitted := map[string]bool{}
 
 	layerReader, err := layer.Uncompressed()
 	if err != nil {
@@ -332,6 +341,11 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 				continue
 			}
 		}
+		// A hardlink target is an archive path like Name, so clean it the
+		// same way or the exported link will not match the exported target.
+		if header.Typeflag == tar.TypeLink {
+			header.Linkname = path.Clean(header.Linkname)
+		}
 
 		// force PAX format to remove Name/Linkname length limit of 100 characters
 		// required by USTAR and to not depend on internal tar package guess which
@@ -348,21 +362,22 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 			continue
 		}
 
-		tombstone := strings.HasPrefix(basename, whiteoutPrefix)
-		if tombstone {
-			basename = basename[len(whiteoutPrefix):]
+		if strings.HasPrefix(basename, whiteoutPrefix) {
+			layerTombstones[path.Join(dirname, basename[len(whiteoutPrefix):])] = true
+			continue
 		}
 
-		// check if we have seen value before
-		// if we're checking a directory, don't filepath.Join names
-		var name string
-		if header.Typeflag == tar.TypeDir {
-			name = header.Name
-		} else {
-			name = path.Join(dirname, basename)
-		}
+		name := header.Name
+		isDir := header.Typeflag == tar.TypeDir
 
-		if _, ok := fileMap[name]; ok && !tombstone {
+		if hidesChildren, ok := fileMap[name]; ok {
+			// An upper layer already provides this path, so this entry is not
+			// exported.  If the upper layer's entry is a directory and this one
+			// is not, the subtree that lower layers may have here was replaced
+			// by this entry and must not show through the upper directory.
+			if !hidesChildren && !isDir {
+				fileMap[name] = true
+			}
 			continue
 		}
 
@@ -378,20 +393,36 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 
 		// mark file as handled. non-directory implicitly tombstones
 		// any entries with a matching (or child) name
-		fileMap[name] = tombstone || (header.Typeflag != tar.TypeDir)
-		if !tombstone {
-			if err := tarWriter.WriteHeader(header); err != nil {
+		fileMap[name] = !isDir
+
+		if header.Typeflag == tar.TypeLink && !emitted[header.Linkname] {
+			// The link's target did not make it into the export, but the
+			// link itself is visible: give it the target's content.
+			if err := copyHardlinkTarget(tarWriter, layer, header); err != nil {
 				return err
 			}
-			if header.Size > 0 {
-				if _, err := io.CopyN(tarWriter, tarReader, header.Size); err != nil {
-					return err
-				}
+			emitted[name] = true
+			continue
+		}
+
+		if err := tarWriter.WriteHeader(header); err != nil {
+			return err
+		}
+		if header.Size > 0 {
+			if _, err := io.CopyN(tarWriter, tarReader, header.Size); err != nil {
+				return err
 			}
+		}
+		if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeLink {
+			emitted[name] = true
 		}
 	}
 
-	// Opaque dirs found in this layer now hide entries in lower layers.
+	// Whiteouts and opaque dirs found in this layer now hide entries in lower
+	// layers.
+	for name := range layerTombstones {
+		fileMap[name] = true
+	}
 	for d := range layerOpaque {
 		opaqueDirs[d] = true
 	}
@@ -403,6 +434,70 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 	// pkg/v1/validate/layer.go performs the same drain.
 	if _, err := io.Copy(io.Discard, layerReader); err != nil {
 		return fmt.Errorf("verifying layer: %w", err)
+	}
+	return nil
+}
+
+// copyHardlinkTarget writes the regular file that link (a TypeLink header
+// from layer) points at, under link's own name.  The layer is re-read from
+// the start since tar streams cannot seek backwards; this only happens for
+// hardlinks whose target an upper layer hid or replaced, which is rare.
+//
+// Chains of hardlinks are followed within the layer.  If the target cannot be
+// found in the layer at all (a link into another layer, which the tar format
+// cannot express) the link is dropped rather than exported dangling.
+func copyHardlinkTarget(tarWriter *tar.Writer, layer v1.Layer, link *tar.Header) error {
+	target := link.Linkname
+	for hops := 0; hops < 32; hops++ {
+		rc, err := layer.Uncompressed()
+		if err != nil {
+			return fmt.Errorf("reading layer contents: %w", err)
+		}
+		next, err := func() (string, error) {
+			defer rc.Close()
+			tr := tar.NewReader(rc)
+			for {
+				h, err := tr.Next()
+				if errors.Is(err, io.EOF) {
+					return "", nil
+				}
+				if err != nil {
+					return "", fmt.Errorf("reading tar: %w", err)
+				}
+				if path.Clean(h.Name) != target {
+					continue
+				}
+				switch h.Typeflag {
+				case tar.TypeLink:
+					return path.Clean(h.Linkname), nil
+				case tar.TypeReg:
+					out := *h
+					out.Name = link.Name
+					out.Linkname = ""
+					out.Format = tar.FormatPAX
+					if err := tarWriter.WriteHeader(&out); err != nil {
+						return "", err
+					}
+					if out.Size > 0 {
+						if _, err := io.CopyN(tarWriter, tr, out.Size); err != nil {
+							return "", err
+						}
+					}
+					return "", nil
+				default:
+					// hardlink to something that is not a regular file; nothing
+					// sensible to copy.
+					return "", nil
+				}
+			}
+		}()
+		if err != nil {
+			return err
+		}
+		if next == "" {
+			return nil
+		}
+		target = next
 	}
 	return nil
 }
