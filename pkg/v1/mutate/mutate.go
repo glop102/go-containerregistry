@@ -42,6 +42,13 @@ const whiteoutPrefix = ".wh."
 // matched exactly and handled before the generic per-file whiteout logic.
 const opaqueWhiteout = ".wh..wh..opq"
 
+// whiteoutMetaPrefix marks AUFS bookkeeping entries that some (older) layer
+// producers ship alongside real content: .wh..wh.plnk/ holds hardlink
+// placeholders, .wh..wh.orph/ orphaned inodes, .wh..wh.aufs is a marker file.
+// None of them are part of the image filesystem, so they are never exported.
+// The opaque marker shares the prefix and is handled separately.
+const whiteoutMetaPrefix = whiteoutPrefix + whiteoutPrefix
+
 // Addendum contains layers and history to be appended
 // to a base image
 type Addendum struct {
@@ -362,6 +369,14 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 			continue
 		}
 
+		// AUFS metadata (.wh..wh.plnk/..., .wh..wh.orph/..., .wh..wh.aufs) is
+		// not content and is not a whiteout of anything; drop it and everything
+		// beneath it.  Hardlinks into .wh..wh.plnk/ still resolve because
+		// copyHardlinkTarget scans the raw layer rather than the export.
+		if isAufsMetadata(header.Name) {
+			continue
+		}
+
 		if strings.HasPrefix(basename, whiteoutPrefix) {
 			layerTombstones[path.Join(dirname, basename[len(whiteoutPrefix):])] = true
 			continue
@@ -512,6 +527,17 @@ func inOpaqueDir(opaqueDirs map[string]bool, file string) bool {
 			return true
 		}
 		file = dirname
+	}
+	return false
+}
+
+// isAufsMetadata reports whether any component of name is an AUFS
+// bookkeeping entry (see whiteoutMetaPrefix).
+func isAufsMetadata(name string) bool {
+	for _, c := range strings.Split(name, "/") {
+		if strings.HasPrefix(c, whiteoutMetaPrefix) && c != opaqueWhiteout {
+			return true
+		}
 	}
 	return false
 }
