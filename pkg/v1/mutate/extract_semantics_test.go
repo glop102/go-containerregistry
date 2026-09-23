@@ -160,8 +160,10 @@ func extractTree(t *testing.T, img v1.Image) map[string]string {
 //   - AUFS bookkeeping entries (.wh..wh.plnk/, .wh..wh.orph/, .wh..wh.aufs)
 //     never reach the export, though hardlinks into .wh..wh.plnk/ still get
 //     their content;
-//   - a symlink in a lower layer is replaced outright when an upper layer
-//     turns that path into a directory.
+//   - a symlink (or any non-directory) in a lower layer is replaced outright
+//     when an upper layer turns that path into a directory, whether with an
+//     explicit directory entry or merely by having entries beneath it;
+//     a lower directory merges with such an implied directory instead.
 func TestExtractLayerSemantics(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -314,6 +316,44 @@ func TestExtractLayerSemantics(t *testing.T) {
 				"real": "dir", "real/target": "file:target",
 				"link": "dir", "link/child": "file:child",
 			},
+		},
+		{
+			name: "symlink to a file replaced by an implicit dir of the same name above",
+			layers: [][]entry{
+				// no dir entries: "real" and "link" exist only because file
+				// paths beneath them do, which is common in ad-hoc layers.
+				{file("real/target", "target"), symlink("link", "real/target")},
+				{file("link/child", "child")},
+			},
+			// The upper layer's link/child implies link is a directory there,
+			// so the lower symlink at link must not show through: extracting
+			// the result would otherwise write child through the symlink into
+			// real/, or fail.
+			want: map[string]string{
+				"real/target": "file:target",
+				"link/child":  "file:child",
+			},
+		},
+		{
+			name: "explicit dir below merges with an implicit dir above",
+			layers: [][]entry{
+				{dir("d"), file("d/old", "old")},
+				{file("d/new", "new")},
+			},
+			// An implied directory only replaces non-directories; the lower
+			// layer's explicit d/ entry (and its metadata) is kept.
+			want: map[string]string{"d": "dir", "d/old": "file:old", "d/new": "file:new"},
+		},
+		{
+			name: "dir replaced by symlink then by an implicit dir again",
+			layers: [][]entry{
+				{dir("d"), file("d/old", "old")},
+				{symlink("d", "elsewhere")},
+				{file("d/new", "new")},
+			},
+			// The middle layer's symlink wiped the bottom directory, so d/old
+			// must not resurface under the top layer's implied d/.
+			want: map[string]string{"d/new": "file:new"},
 		},
 	}
 	for _, tt := range tests {
