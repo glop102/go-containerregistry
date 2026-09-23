@@ -156,7 +156,12 @@ func extractTree(t *testing.T, img v1.Image) map[string]string {
 //     directory was replaced by a non-directory everything beneath it stays
 //     gone even when a higher layer turns the path into a directory again;
 //   - a hardlink keeps its layer's content even when the name it links to is
-//     hidden or replaced by an upper layer.
+//     hidden or replaced by an upper layer;
+//   - AUFS bookkeeping entries (.wh..wh.plnk/, .wh..wh.orph/, .wh..wh.aufs)
+//     never reach the export, though hardlinks into .wh..wh.plnk/ still get
+//     their content;
+//   - a symlink in a lower layer is replaced outright when an upper layer
+//     turns that path into a directory.
 func TestExtractLayerSemantics(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -270,6 +275,45 @@ func TestExtractLayerSemantics(t *testing.T) {
 				{file("./f1", "shared"), hardlink("./f2", "./f1")},
 			},
 			want: map[string]string{"f1": "file:shared", "f2": "file:shared"},
+		},
+		{
+			name: "aufs metadata entries are never exported",
+			layers: [][]entry{
+				{
+					dir(".wh..wh.plnk"), file(".wh..wh.plnk/1", "lower-plnk"),
+					dir(".wh..wh.orph"), file(".wh..wh.orph/gone", "lower-orph"),
+					file(".wh..wh.aufs", ""),
+					dir("d"), file("d/lower", "lower"),
+				},
+				{
+					dir(".wh..wh.plnk"), file(".wh..wh.plnk/2", "upper-plnk"),
+					dir(".wh..wh.orph"), file(".wh..wh.orph/gone", "upper-orph"),
+					file(".wh..wh.aufs", ""),
+					dir("d"), file("d/upper", "upper"),
+				},
+			},
+			want: map[string]string{"d": "dir", "d/lower": "file:lower", "d/upper": "file:upper"},
+		},
+		{
+			name: "aufs hardlink placeholder resolves to its content",
+			layers: [][]entry{
+				{
+					dir(".wh..wh.plnk"), file(".wh..wh.plnk/42.1", "shared"),
+					dir("bin"), hardlink("bin/a", ".wh..wh.plnk/42.1"), hardlink("bin/b", ".wh..wh.plnk/42.1"),
+				},
+			},
+			want: map[string]string{"bin": "dir", "bin/a": "file:shared", "bin/b": "file:shared"},
+		},
+		{
+			name: "symlink to a file replaced by a dir of the same name above",
+			layers: [][]entry{
+				{dir("real"), file("real/target", "target"), symlink("link", "real/target")},
+				{dir("link"), file("link/child", "child")},
+			},
+			want: map[string]string{
+				"real": "dir", "real/target": "file:target",
+				"link": "dir", "link/child": "file:child",
+			},
 		},
 	}
 	for _, tt := range tests {
