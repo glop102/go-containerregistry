@@ -282,6 +282,11 @@ func extract(img v1.Image, w io.Writer) error {
 	// opaqueDirs holds directories opaqued by an upper layer; entries under them
 	// from lower (later-iterated) layers are hidden.
 	opaqueDirs := map[string]bool{}
+	// impliedDirs holds paths that an upper layer treats as directories only
+	// because it has entries beneath them, without an explicit entry for the
+	// directory itself.  A non-directory at such a path in a lower layer was
+	// replaced and must not be exported.
+	impliedDirs := map[string]bool{}
 
 	layers, err := img.Layers()
 	if err != nil {
@@ -292,14 +297,14 @@ func extract(img v1.Image, w io.Writer) error {
 	// whiteout layers more efficient, since we can just keep track of the removed
 	// files as we see .wh. layers and ignore those in previous layers.
 	for i := len(layers) - 1; i >= 0; i-- {
-		if err := extractLayer(tarWriter, fileMap, opaqueDirs, layers[i]); err != nil {
+		if err := extractLayer(tarWriter, fileMap, opaqueDirs, impliedDirs, layers[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, layer v1.Layer) error {
+func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs, impliedDirs map[string]bool, layer v1.Layer) error {
 	// Whiteouts (.wh.NAME) and opaque markers (.wh..wh..opq) hide entries in
 	// lower layers only; per the image spec an entry that sits next to its own
 	// whiteout in the same layer stays visible, whatever the member order.  So
@@ -366,6 +371,7 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 		// the whiteout prefix, so handle it before the generic per-file logic.
 		if basename == opaqueWhiteout {
 			layerOpaque[dirname] = true
+			markImpliedParents(impliedDirs, header.Name)
 			continue
 		}
 
@@ -379,6 +385,7 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 
 		if strings.HasPrefix(basename, whiteoutPrefix) {
 			layerTombstones[path.Join(dirname, basename[len(whiteoutPrefix):])] = true
+			markImpliedParents(impliedDirs, header.Name)
 			continue
 		}
 
@@ -395,6 +402,14 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 			}
 			continue
 		}
+		if !isDir && impliedDirs[name] {
+			// An upper layer has entries beneath this path but no entry for the
+			// path itself, so it is a directory there and this non-directory
+			// was replaced, together with anything lower layers had beneath it.
+			// A directory here would merge instead, so it falls through.
+			fileMap[name] = true
+			continue
+		}
 
 		// check for a whited out parent directory
 		if inWhiteoutDir(fileMap, name) {
@@ -409,6 +424,7 @@ func extractLayer(tarWriter *tar.Writer, fileMap, opaqueDirs map[string]bool, la
 		// mark file as handled. non-directory implicitly tombstones
 		// any entries with a matching (or child) name
 		fileMap[name] = !isDir
+		markImpliedParents(impliedDirs, name)
 
 		if header.Typeflag == tar.TypeLink && !emitted[header.Linkname] {
 			// The link's target did not make it into the export, but the
@@ -529,6 +545,17 @@ func inOpaqueDir(opaqueDirs map[string]bool, file string) bool {
 		file = dirname
 	}
 	return false
+}
+
+// markImpliedParents records every proper ancestor of name as a directory
+// the current layer implies by having an entry beneath it.
+func markImpliedParents(impliedDirs map[string]bool, name string) {
+	for p := path.Dir(name); p != "." && p != "/"; p = path.Dir(p) {
+		if impliedDirs[p] {
+			return // and so are all of its ancestors
+		}
+		impliedDirs[p] = true
+	}
 }
 
 // isAufsMetadata reports whether any component of name is an AUFS
